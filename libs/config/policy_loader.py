@@ -20,7 +20,10 @@ class PolicyLoader:
         # 🔥 RELOAD IF FILE CHANGED
         if self._cache is None or mtime != self._last_mtime:
             with open(path, "r") as f:
-                self._cache = yaml.safe_load(f)
+                try:
+                    self._cache = yaml.safe_load(f)
+                except yaml.YAMLError as e:
+                    raise ValueError(f"Invalid YAML format: {e}")
             self._last_mtime = mtime
 
         return self._cache
