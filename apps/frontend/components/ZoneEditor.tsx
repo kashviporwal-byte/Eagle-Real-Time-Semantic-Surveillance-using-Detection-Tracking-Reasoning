@@ -27,6 +27,14 @@ const CLOSE_RADIUS = 10;
 /** Minimum number of points required to form a valid polygon. */
 const MIN_POLYGON_POINTS = 3;
 
+/** Keyboard step sizes in canvas pixels. */
+const KEY_STEP       = 10;
+const KEY_STEP_LARGE = 50;
+
+/** Canvas logical dimensions — must match the <canvas> width/height attrs. */
+const CANVAS_W = 960;
+const CANVAS_H = 540;
+
 /** Preset colour palette for zone selection. */
 const PALETTE = [
   "#ef4444", // red
@@ -71,6 +79,11 @@ function generateId(): string {
   return `zone-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+/** Clamps a number between min and max (inclusive). */
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
 // ─── Canvas drawing helpers ───────────────────────────────────────────────────
 
 /**
@@ -105,7 +118,7 @@ function drawZone(ctx: CanvasRenderingContext2D, zone: Zone): void {
 /**
  * Draws the in-progress (draft) polygon as a dashed line with vertex dots.
  * The first vertex is rendered larger to act as a close-target indicator.
- * A rubber-band line follows the mouse cursor.
+ * A rubber-band line follows the mouse / keyboard cursor.
  */
 function drawDraft(
   ctx: CanvasRenderingContext2D,
@@ -150,6 +163,8 @@ export default function ZoneEditor() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef    = useRef<HTMLImageElement | null>(null);
 
+  // ── State ──────────────────────────────────────────────────────────────────
+
   const [zones,          setZones]          = useState<Zone[]>([]);
   const [draft,          setDraft]          = useState<Point[]>([]);
   const [mouse,          setMouse]          = useState<Point | null>(null);
@@ -161,6 +176,15 @@ export default function ZoneEditor() {
   const [snapshotLoaded, setSnapshotLoaded] = useState(false);
   const [snapshotError,  setSnapshotError]  = useState(false);
 
+  // [Fix 3] Hydration gate — block editing until /zones read completes.
+  const [zonesHydrated,  setZonesHydrated]  = useState(false);
+  const [zonesLoadError, setZonesLoadError] = useState(false);
+
+  // [Fix 1] Keyboard virtual cursor — starts at canvas centre.
+  const [keyCursor, setKeyCursor] = useState<Point>({ x: CANVAS_W / 2, y: CANVAS_H / 2 });
+
+  // ── Refs ───────────────────────────────────────────────────────────────────
+
   /**
    * Always-current ref to zones array.
    * Prevents stale closure bugs — closePolygon reads this
@@ -168,6 +192,15 @@ export default function ZoneEditor() {
    */
   const zonesRef = useRef<Zone[]>([]);
   useEffect(() => { zonesRef.current = zones; }, [zones]);
+
+  /**
+   * [Fix 2] Save-nonce ref — incremented on every zone mutation.
+   * saveZones() captures the value before the fetch; if it has changed
+   * by the time the response arrives, the result is treated as stale and
+   * we do NOT show "✓ Saved!".
+   */
+  const saveNonceRef = useRef<number>(0);
+  useEffect(() => { saveNonceRef.current += 1; }, [zones]);
 
   // ── Load snapshot on mount ─────────────────────────────────────────────────
   useEffect(() => {
@@ -178,14 +211,31 @@ export default function ZoneEditor() {
   }, []);
 
   // ── Restore persisted zones on mount ──────────────────────────────────────
+  // [Fix 3] Sets zonesHydrated on success.
+  // 404 / endpoint-not-found → treat as "no zones yet" (hydrated, empty list).
+  // Only a genuine server error (5xx) or a network-level failure sets
+  // zonesLoadError and blocks editing — those indicate the server is unhealthy
+  // and we can't trust that our local list is complete.
   useEffect(() => {
     fetch("/zones")
       .then((r) => {
+        // 404 means the endpoint exists but no zones have been saved yet —
+        // safe to proceed with an empty list.
+        if (r.status === 404) {
+          setZonesHydrated(true);
+          return null;
+        }
+        // Any other non-OK status (5xx, 401, …) is a real problem.
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then((data: Zone[]) => {
-        if (!Array.isArray(data)) return;
+      .then((data: Zone[] | null) => {
+        if (data === null) return; // 404 path already handled above
+        if (!Array.isArray(data)) {
+          // Server returned unexpected shape — treat as hydrated with nothing
+          setZonesHydrated(true);
+          return;
+        }
         setZones((prev) => {
           // Server data wins on ID conflict — merge preserving both local and remote
           const merged = new Map<string, Zone>();
@@ -193,8 +243,13 @@ export default function ZoneEditor() {
           data.forEach((z) => merged.set(z.id, z));
           return Array.from(merged.values());
         });
+        setZonesHydrated(true);
       })
-      .catch(() => {/* zones endpoint may not exist yet — fail silently */});
+      .catch(() => {
+        // Network failure or 5xx — we genuinely don't know the server state,
+        // so block editing to prevent overwriting unseen zones.
+        setZonesLoadError(true);
+      });
   }, []);
 
   // ── Canvas render loop ─────────────────────────────────────────────────────
@@ -273,13 +328,109 @@ export default function ZoneEditor() {
     setMouse(null);
   }
 
+  // [Fix 1] ── Keyboard handlers ─────────────────────────────────────────────
+
+  /**
+   * Moves the virtual keyboard cursor with Arrow keys and dispatches
+   * vertex-placement / polygon-close / cancel actions via keyboard.
+   *
+   * Controls:
+   *   Arrow keys        — move cursor by KEY_STEP px
+   *   Shift + Arrow     — move cursor by KEY_STEP_LARGE px
+   *   Enter / Space     — place vertex (or close polygon if near first point)
+   *   C                 — close polygon (requires ≥ MIN_POLYGON_POINTS)
+   *   Backspace         — cancel current draft
+   */
+  function handleKeyDown(e: React.KeyboardEvent<HTMLCanvasElement>): void {
+    const step = e.shiftKey ? KEY_STEP_LARGE : KEY_STEP;
+
+    switch (e.key) {
+      case "ArrowLeft":
+        e.preventDefault();
+        setKeyCursor((prev) => {
+          const next = { ...prev, x: clamp(prev.x - step, 0, CANVAS_W) };
+          setMouse(next);
+          return next;
+        });
+        break;
+      case "ArrowRight":
+        e.preventDefault();
+        setKeyCursor((prev) => {
+          const next = { ...prev, x: clamp(prev.x + step, 0, CANVAS_W) };
+          setMouse(next);
+          return next;
+        });
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setKeyCursor((prev) => {
+          const next = { ...prev, y: clamp(prev.y - step, 0, CANVAS_H) };
+          setMouse(next);
+          return next;
+        });
+        break;
+      case "ArrowDown":
+        e.preventDefault();
+        setKeyCursor((prev) => {
+          const next = { ...prev, y: clamp(prev.y + step, 0, CANVAS_H) };
+          setMouse(next);
+          return next;
+        });
+        break;
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        handleKeyPlaceVertex();
+        break;
+      case "c":
+      case "C":
+        e.preventDefault();
+        if (draft.length >= MIN_POLYGON_POINTS) closePolygon();
+        break;
+      case "Backspace":
+        e.preventDefault();
+        cancelDraft();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Places a vertex at the current keyboard cursor position,
+   * or closes the polygon if the cursor is near the first point.
+   */
+  function handleKeyPlaceVertex(): void {
+    const pt = keyCursor;
+    if (draft.length >= MIN_POLYGON_POINTS && dist(pt, draft[0]) <= CLOSE_RADIUS) {
+      closePolygon();
+      return;
+    }
+    setDraft((prev) => [...prev, pt]);
+    setMouse(pt); // keep rubber-band preview in sync
+  }
+
   // ── Polygon lifecycle ──────────────────────────────────────────────────────
 
   /**
    * Validates the zone name and commits the draft polygon to the zone list.
    * Resets all drafting state on success.
+   *
+   * [Fix 3] Early-returns with an error message if server zones haven't
+   * been confirmed yet, so the duplicate-name check always operates on
+   * the full authoritative zone list.
    */
   function closePolygon(): void {
+    // [Fix 3] Block until the initial /zones fetch has resolved
+    if (!zonesHydrated || zonesLoadError) {
+      setNameError(
+        zonesLoadError
+          ? "Cannot save: zone list failed to load from server."
+          : "Please wait — loading existing zones…"
+      );
+      return;
+    }
+
     if (draft.length < MIN_POLYGON_POINTS) return;
 
     const trimmed = zoneName.trim();
@@ -330,18 +481,30 @@ export default function ZoneEditor() {
   /**
    * POSTs all current zones to /zones as JSON.
    *
-   * Guard clause: returns immediately if a save is already in-flight or
-   * there are no zones to save, preventing duplicate requests from rapid clicks.
+   * [Fix 2] Captures saveNonceRef.current before the fetch. After the
+   * response arrives, compares against the current nonce — only marks
+   * "saved" when they match. If zones changed mid-flight, silently
+   * returns to "idle" so the user knows they need to save again.
+   *
+   * [Fix 3] Blocked when zonesHydrated is false or zonesLoadError is set,
+   * preventing a POST that would overwrite unseen server zones.
    *
    * Status transitions:
    *   idle → saving → saved  (auto-resets to idle after 2.5 s)
+   *   idle → saving → idle   (zones mutated mid-flight — silent dirty state)
    *   idle → saving → error  (auto-resets to idle after 3 s; shows message)
    */
   async function saveZones(): Promise<void> {
+    // [Fix 3] Block if we don't have a confirmed view of server zones
+    if (!zonesHydrated || zonesLoadError) return;
+
     if (saveStatus === "saving" || zones.length === 0) return;
 
     setSaveStatus("saving");
     setErrorMessage("");
+
+    // [Fix 2] Snapshot the nonce at the moment this save starts
+    const nonceAtStart = saveNonceRef.current;
 
     try {
       const payload = zones.map(({ id, name, color, points }) => ({
@@ -362,8 +525,14 @@ export default function ZoneEditor() {
         throw new Error(text || `HTTP ${res.status}`);
       }
 
-      setSaveStatus("saved");
-      setTimeout(() => setSaveStatus("idle"), 2500);
+      // [Fix 2] Only report "saved" when zones haven't changed since we fired
+      if (saveNonceRef.current === nonceAtStart) {
+        setSaveStatus("saved");
+        setTimeout(() => setSaveStatus("idle"), 2500);
+      } else {
+        // Zones mutated mid-flight — the sent payload is stale; go dirty
+        setSaveStatus("idle");
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Save failed";
       setErrorMessage(msg);
@@ -403,21 +572,42 @@ export default function ZoneEditor() {
       <div style={styles.canvasWrapper}>
         <canvas
           ref={canvasRef}
-          width={960}
-          height={540}
+          width={CANVAS_W}
+          height={CANVAS_H}
+          // [Fix 1] tabIndex + role make the canvas keyboard-focusable
+          tabIndex={0}
+          role="application"
           style={{ ...styles.canvas, cursor: cursorStyle }}
           onClick={handleCanvasClick}
           onMouseMove={handleMouseMove}
           onMouseLeave={handleMouseLeave}
-          aria-label="Camera snapshot canvas for drawing restricted zones"
+          // [Fix 1] Keyboard vertex placement
+          onKeyDown={handleKeyDown}
+          onFocus={() => setMouse(keyCursor)}
+          onBlur={() => setMouse(null)}
+          aria-label={
+            "Camera snapshot canvas for drawing restricted zones. " +
+            "Use arrow keys to move cursor, Enter or Space to place a point, " +
+            "C to close the polygon, Backspace to cancel."
+          }
         />
         {draft.length > 0 && (
           <div style={styles.draftBadge}>
             Drawing… {draft.length} point{draft.length !== 1 ? "s" : ""}
-            {draft.length >= MIN_POLYGON_POINTS ? " — click first point to close" : ""}
+            {draft.length >= MIN_POLYGON_POINTS
+              ? " — click first point or press C to close"
+              : " — click or press Enter/Space to add points"}
           </div>
         )}
       </div>
+
+      {/* [Fix 3] Zone-load error banner — blocks editing when shown */}
+      {zonesLoadError && (
+        <p role="alert" style={styles.saveError}>
+          ⚠ Could not load existing zones from server. Editing and saving are
+          disabled to prevent overwriting unseen data. Please refresh to retry.
+        </p>
+      )}
 
       {/* ── Controls ── */}
       <div style={styles.controls}>
