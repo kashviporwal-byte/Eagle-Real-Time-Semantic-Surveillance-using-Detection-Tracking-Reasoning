@@ -15,16 +15,49 @@ SUSPICIOUS_ACTIONS = {
 }
 
 
+"""
+Clear cooldown state for a track after reasoning completes.
+"""
+
 def reset_cooldown(track_id: int) -> None:
     """Clear cooldown state after reasoning completes."""
     _reasoning_cooldowns.pop(track_id, None)
 
+"""
+Determine whether VLM/LLM reasoning should be triggered
+for a suspicious track sequence.
+
+Conditions:
+- track must be inside a restricted zone
+- dwell time must exceed configured threshold
+- at least one suspicious action must exist
+- track must not be inside cooldown window
+"""
 
 def should_trigger_reasoning(
     event: TrackLifecycleEvent,
     suspicious_actions: set[str],
 ) -> bool:
-    """Determine whether VLM/LLM reasoning should be triggered."""
+    """
+    Determine whether VLM/LLM reasoning should be triggered
+    for a suspicious track sequence.
+
+    Conditions:
+    - track must be inside a restricted zone
+    - dwell time must exceed configured threshold
+    - at least one suspicious action must exist
+    - track must not be inside cooldown window
+    """
+
+    if settings.reasoning_dwell_threshold_seconds < 0:
+        raise ValueError(
+            "reasoning_dwell_threshold_seconds must be >= 0"
+        )
+
+    if settings.reasoning_cooldown_seconds < 0:
+        raise ValueError(
+            "reasoning_cooldown_seconds must be >= 0"
+        )
 
     # Must be inside at least one restricted zone
     if not event.zones_present:

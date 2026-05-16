@@ -1,3 +1,6 @@
+import pytest
+from libs.config.settings import settings
+
 from services.memory.trigger import (
     should_trigger_reasoning,
     reset_cooldown,
@@ -7,6 +10,19 @@ from libs.schemas.tracking import (
     TrackLifecycleEvent,
     TrackState,
 )
+
+@pytest.fixture(autouse=True)
+def fixed_reasoning_gate_config():
+    old_dwell = settings.reasoning_dwell_threshold_seconds
+    old_cooldown = settings.reasoning_cooldown_seconds
+
+    settings.reasoning_dwell_threshold_seconds = 5.0
+    settings.reasoning_cooldown_seconds = 5.0
+
+    yield
+
+    settings.reasoning_dwell_threshold_seconds = old_dwell
+    settings.reasoning_cooldown_seconds = old_cooldown
 
 
 def make_event(
