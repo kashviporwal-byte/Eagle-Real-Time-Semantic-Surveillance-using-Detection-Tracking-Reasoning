@@ -63,6 +63,7 @@ def benchmark_kafka_producer(n_events=1000):
     for i in range(n_events):
         event = make_event(i)
         producer.produce_event(event)
+    producer.producer.flush()
     end = time.time()
     
     duration = end - start

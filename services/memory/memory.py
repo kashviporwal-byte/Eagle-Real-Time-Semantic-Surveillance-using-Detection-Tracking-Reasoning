@@ -296,3 +296,4 @@ class MemoryStore:
     def expire_track(self, track_id: int, camera_id: str) -> None:
         """Explicitly remove track data."""
         self._r.delete(f"events:{camera_id}:{track_id}")
+        self._r.srem(f"active_tracks:{camera_id}", track_id)
