@@ -36,7 +36,9 @@ from typing import Optional
 import numpy as np
 
 from libs.observability.metrics import redis_write_latency
+from libs.schemas.memory import ActionHint, TrackEvent, TrackSequence
 from libs.schemas.tracking import TrackLifecycleEvent, TrackState
+from libs.schemas.memory import TrackEvent, TrackSequence
 from services.tracking.cross_camera_reid import CrossCameraReID
 
 logger = logging.getLogger(__name__)
@@ -285,7 +287,30 @@ class MemoryStore:
     def _active_key(self) -> str:
         return f"active:{self._camera_id}"
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    def get_sequence(self, track_id: int, last_n: Optional[int] = None) -> "TrackSequence":
+        key = self._events_key(track_id)
+        raw = self._r.lrange(key, 0, -1)
+        events: list[TrackEvent] = []
+        for item in raw:
+            data = json.loads(item)
+            events.append(TrackEvent(**data))
+        if last_n is not None:
+            events = events[-last_n:]
+        # Populate summary fields expected by consumers/tests
+        camera_id = events[0].camera_id if events else "cam_01"
+        total_dwell = sum(e.dwell_time_seconds for e in events)
+        zones_visited: list[str] = []
+        for e in events:
+            if e.zone and e.zone not in zones_visited:
+                zones_visited.append(e.zone)
+
+        return TrackSequence(
+            track_id=track_id,
+            camera_id=camera_id,
+            events=events,
+            total_dwell=total_dwell,
+            zones_visited=zones_visited,
+        )
 
     def store_event(self, event) -> None:
         """
